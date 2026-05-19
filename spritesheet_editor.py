@@ -2,7 +2,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import json
 import os
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
+from tkinter import colorchooser
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -169,6 +170,11 @@ class PreviewCanvas(tk.Canvas):
         self._start_size = None
         self._resize_callback = None
 
+        self.show_border = None        # BooleanVar set by app
+        self.show_checkerboard = None  # BooleanVar set by app
+        self._border_color = "#ff4444"
+        self._cb_cache = {}
+
         self.bind("<Configure>", self._on_configure)
         self.bind("<Button-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
@@ -207,13 +213,48 @@ class PreviewCanvas(tk.Canvas):
         self.delete("all")
 
 
+    def set_border_color(self, color):
+        self._border_color = color
+        self._render_frame()
+
+    def _get_checkerboard(self, w, h):
+        key = (w, h)
+        if key not in self._cb_cache:
+            cb = Image.new("RGBA", (w, h))
+            draw = ImageDraw.Draw(cb)
+            sz = 8
+            c1, c2 = (180, 180, 180, 255), (120, 120, 120, 255)
+            for cy in range(0, h, sz):
+                for cx in range(0, w, sz):
+                    color = c1 if ((cx // sz + cy // sz) % 2 == 0) else c2
+                    draw.rectangle([cx, cy, cx + sz - 1, cy + sz - 1], fill=color)
+            self._cb_cache[key] = cb
+        return self._cb_cache[key].copy()
+
     def _render_frame(self):
         self.delete("all")
+        w, h = self.preview_w, self.preview_h
+        use_cb = self.show_checkerboard and self.show_checkerboard.get()
 
         if self._current_source_pil is not None:
-            resized = self._current_source_pil.resize((self.preview_w, self.preview_h), Image.NEAREST)
-            self._current_photo = ImageTk.PhotoImage(resized)
+            resized = self._current_source_pil.resize((w, h), Image.NEAREST)
+            if use_cb:
+                cb = self._get_checkerboard(w, h)
+                composed = Image.alpha_composite(cb, resized)
+                self._current_photo = ImageTk.PhotoImage(composed)
+            else:
+                self._current_photo = ImageTk.PhotoImage(resized)
             self.create_image(0, 0, image=self._current_photo, anchor=tk.NW, tags="frame_img")
+        elif use_cb:
+            cb = self._get_checkerboard(w, h)
+            self._current_photo = ImageTk.PhotoImage(cb)
+            self.create_image(0, 0, image=self._current_photo, anchor=tk.NW, tags="frame_img")
+
+        if self.show_border and self.show_border.get():
+            self.create_rectangle(
+                1, 1, w - 2, h - 2,
+                outline=self._border_color, width=2, tags="border_overlay"
+            )
 
         self.redraw_guides()
 
@@ -334,6 +375,19 @@ class SpritesheetEditor:
         self._internal_preview_update = False
         self._internal_preview_resize = False
 
+        # Visual aids
+        self.show_border = tk.BooleanVar(value=True)
+        self.show_checkerboard = tk.BooleanVar(value=True)
+
+        # Canvas grid drag state
+        self._grid_cells = []
+        self._grid_scale = 1.0
+        self._canvas_drag_mode = None
+        self._canvas_drag_start = None
+        self._canvas_drag_base = None
+        self._canvas_drag_moved = False
+        self._canvas_pending_select = None
+
         self._build_ui()
         self._bind_live_updates()
 
@@ -386,6 +440,9 @@ class SpritesheetEditor:
             font=("Segoe UI", 10, "bold")
         )
         style.configure("TLabelframe.Label", background="#1c1b19", foreground="#4f98a3")
+        style.configure("TCheckbutton", background="#1c1b19", foreground="#cdccca",
+                        font=("Segoe UI", 10))
+        style.map("TCheckbutton", background=[("active", "#1c1b19")])
 
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill=tk.X, side=tk.TOP)
@@ -419,18 +476,18 @@ class SpritesheetEditor:
 
         gf = ttk.LabelFrame(left, text="Griglia", padding=10)
         gf.pack(fill=tk.X, pady=(0, 8))
-        self._spin_row(gf, "Larghezza frame (w):", self.frame_w, 1, 4096)
-        self._spin_row(gf, "Altezza frame (h):", self.frame_h, 1, 4096)
+        self._spin_slider_row(gf, "Larghezza frame (w):", self.frame_w, 1, 4096)
+        self._spin_slider_row(gf, "Altezza frame (h):", self.frame_h, 1, 4096)
         self._spin_row(gf, "Colonne:", self.cols, 1, 512)
         self._spin_row(gf, "Righe:", self.rows, 1, 512)
         self._spin_row(gf, "N° frame totali:", self.frame_count, 1, 9999)
 
         of = ttk.LabelFrame(left, text="Offset & Spaziatura", padding=10)
         of.pack(fill=tk.X, pady=(0, 8))
-        self._spin_row(of, "Offset X:", self.offset_x, 0, 8192)
-        self._spin_row(of, "Offset Y:", self.offset_y, 0, 8192)
-        self._spin_row(of, "Spacing X:", self.spacing_x, 0, 2048)
-        self._spin_row(of, "Spacing Y:", self.spacing_y, 0, 2048)
+        self._spin_slider_row(of, "Offset X:", self.offset_x, 0, 8192)
+        self._spin_slider_row(of, "Offset Y:", self.offset_y, 0, 8192)
+        self._spin_slider_row(of, "Spacing X:", self.spacing_x, 0, 2048)
+        self._spin_slider_row(of, "Spacing Y:", self.spacing_y, 0, 2048)
 
         af = ttk.LabelFrame(left, text="Anteprima Animazione", padding=10)
         af.pack(fill=tk.X, pady=(0, 8))
@@ -459,6 +516,27 @@ class SpritesheetEditor:
             wraplength=260,
             justify="left"
         ).pack(anchor="w", pady=(6, 0))
+
+        vf = ttk.LabelFrame(left, text="Visibilità", padding=10)
+        vf.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(
+            vf, text="Bordo sprite (preview)",
+            variable=self.show_border,
+            command=self._on_visual_toggle
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            vf, text="Scacchiera trasparenza",
+            variable=self.show_checkerboard,
+            command=self._on_visual_toggle
+        ).pack(anchor="w")
+        bc_row = ttk.Frame(vf)
+        bc_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(bc_row, text="Colore bordo:", anchor="w").pack(side=tk.LEFT)
+        self._border_color_btn = tk.Button(
+            bc_row, width=3, relief=tk.FLAT, bg="#ff4444",
+            command=self._pick_border_color
+        )
+        self._border_color_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         gd = ttk.LabelFrame(left, text="Guide & Righello", padding=10)
         gd.pack(fill=tk.X, pady=(0, 8))
@@ -535,6 +613,10 @@ class SpritesheetEditor:
         self.canvas_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         self.canvas_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.bind("<Button-1>", self._on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self.canvas.bind("<Motion>", self._on_canvas_motion)
 
         preview_outer = ttk.LabelFrame(right, text="Anteprima Frame + Guide", padding=4)
         preview_outer.pack(anchor="w", pady=(0, 4))
@@ -575,6 +657,8 @@ class SpritesheetEditor:
         self.preview_canvas.h_ruler = self.h_ruler
         self.preview_canvas.v_ruler = self.v_ruler
         self.preview_canvas.set_resize_callback(self._on_preview_canvas_resized)
+        self.preview_canvas.show_border = self.show_border
+        self.preview_canvas.show_checkerboard = self.show_checkerboard
 
         self.h_ruler.preview_ref = self.preview_canvas
         self.v_ruler.preview_ref = self.preview_canvas
@@ -614,6 +698,48 @@ class SpritesheetEditor:
 
         if label.startswith("Vai al frame"):
             self.preview_frame_spin = sp
+
+    def _spin_slider_row(self, parent, label, var, from_, to_):
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row, text=label, width=20, anchor="w").pack(side=tk.LEFT)
+        sp = ttk.Spinbox(row, from_=from_, to=to_, textvariable=var, width=6)
+        sp.pack(side=tk.LEFT)
+
+        sl = tk.Scale(
+            row, from_=from_, to=to_,
+            orient=tk.HORIZONTAL, variable=var,
+            showvalue=False, bd=0,
+            bg="#1c1b19", fg="#4f98a3",
+            troughcolor="#2d2c2a",
+            highlightthickness=0,
+            activebackground="#fdab43",
+            sliderrelief=tk.FLAT,
+            length=80, width=12
+        )
+        sl.pack(side=tk.LEFT, padx=(4, 0))
+
+        sp.bind("<Return>", lambda e: self._on_spin_commit())
+        sp.bind("<FocusOut>", lambda e: self._on_spin_commit())
+        sp.bind("<<Increment>>", lambda e: self._on_spin_commit())
+        sp.bind("<<Decrement>>", lambda e: self._on_spin_commit())
+
+        if label.startswith("Vai al frame"):
+            self.preview_frame_spin = sp
+
+    def _on_visual_toggle(self):
+        self.preview_canvas._render_frame()
+
+    def _pick_border_color(self):
+        color = colorchooser.askcolor(
+            initialcolor=self.preview_canvas._border_color,
+            title="Colore bordo"
+        )
+        if color and color[1]:
+            self.preview_canvas._border_color = color[1]
+            self._border_color_btn.config(bg=color[1])
+            self.preview_canvas._render_frame()
 
     def _on_spin_commit(self):
         self.refresh()
@@ -1080,7 +1206,9 @@ class SpritesheetEditor:
         self.canvas.config(scrollregion=(0, 0, disp_w, disp_h))
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_sheet)
 
+        self._grid_scale = scale
         active_idx = self._current_frame_idx
+        cells = []
         idx = 0
         for r in range(rows):
             for c in range(cols):
@@ -1091,6 +1219,8 @@ class SpritesheetEditor:
                 y0 = (oy + r * (fh + sy)) * scale
                 x1 = x0 + fw * scale
                 y1 = y0 + fh * scale
+
+                cells.append((idx, x0, y0, x1, y1))
 
                 active = idx == active_idx
                 color = "#fdab43" if active else "#4f98a3"
@@ -1105,6 +1235,8 @@ class SpritesheetEditor:
                     font=("Segoe UI", max(7, int(9 * scale)))
                 )
                 idx += 1
+
+        self._grid_cells = cells
 
     def _cache_frames(self):
         self._frames_cache = []
@@ -1190,6 +1322,144 @@ class SpritesheetEditor:
         self.preview_canvas.set_frame_pil(self._frames_cache[idx])
         self.lbl_frame_info.config(text=f"Frame: {idx + 1} / {len(self._frames_cache)}")
         self._update_canvas()
+
+    # ─────────────────────────────────────────────────────────────
+    # CANVAS DRAG (grid interaction)
+    # ─────────────────────────────────────────────────────────────
+    def _canvas_hit_test(self, x, y):
+        if not self._grid_cells or self._grid_scale == 0:
+            return None, None
+
+        scale = self._grid_scale
+        EDGE = 6
+        cols = max(1, self._safe_int(self.cols, 1))
+        rows = max(1, self._safe_int(self.rows, 1))
+        sx = self._safe_int(self.spacing_x, 0)
+        sy = self._safe_int(self.spacing_y, 0)
+
+        for idx, x0, y0, x1, y1 in self._grid_cells:
+            c = idx % cols
+            r = idx // cols
+            near_right = abs(x - x1) <= EDGE and y0 - EDGE <= y <= y1 + EDGE
+            near_bottom = abs(y - y1) <= EDGE and x0 - EDGE <= x <= x1 + EDGE
+            near_left = c == 0 and abs(x - x0) <= EDGE and y0 - EDGE <= y <= y1 + EDGE
+            near_top = r == 0 and abs(y - y0) <= EDGE and x0 - EDGE <= x <= x1 + EDGE
+
+            if near_right and near_bottom:
+                return "corner", idx
+            if near_right:
+                return "frame_w", idx
+            if near_bottom:
+                return "frame_h", idx
+            if near_left:
+                return "offset_x", idx
+            if near_top:
+                return "offset_y", idx
+
+        if sx > 0 or sy > 0:
+            for idx, x0, y0, x1, y1 in self._grid_cells:
+                c = idx % cols
+                r = idx // cols
+                if c < cols - 1 and x1 < x < x1 + sx * scale and y0 <= y <= y1:
+                    return "spacing_x", idx
+                if r < rows - 1 and y1 < y < y1 + sy * scale and x0 <= x <= x1:
+                    return "spacing_y", idx
+
+        for idx, x0, y0, x1, y1 in self._grid_cells:
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return "move", idx
+
+        return None, None
+
+    def _on_canvas_press(self, event):
+        if not self.pil_image:
+            return
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        mode, idx = self._canvas_hit_test(x, y)
+        if mode is None:
+            return
+
+        self._canvas_drag_mode = mode
+        self._canvas_drag_start = (x, y)
+        self._canvas_drag_moved = False
+        self._canvas_pending_select = idx if mode == "move" else None
+        self._canvas_drag_base = (
+            max(1, self._safe_int(self.frame_w, 256)),
+            max(1, self._safe_int(self.frame_h, 256)),
+            self._safe_int(self.offset_x, 0),
+            self._safe_int(self.offset_y, 0),
+            self._safe_int(self.spacing_x, 0),
+            self._safe_int(self.spacing_y, 0),
+        )
+
+    def _on_canvas_drag(self, event):
+        if self._canvas_drag_mode is None:
+            return
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        dx = x - self._canvas_drag_start[0]
+        dy = y - self._canvas_drag_start[1]
+
+        if not self._canvas_drag_moved and (abs(dx) > 3 or abs(dy) > 3):
+            self._canvas_drag_moved = True
+
+        if not self._canvas_drag_moved:
+            return
+
+        scale = self._grid_scale
+        if scale == 0:
+            return
+
+        fw, fh, ox, oy, sx, sy = self._canvas_drag_base
+        mode = self._canvas_drag_mode
+
+        if mode in ("frame_w", "corner"):
+            self.frame_w.set(max(1, int(fw + dx / scale)))
+        if mode in ("frame_h", "corner"):
+            self.frame_h.set(max(1, int(fh + dy / scale)))
+        if mode == "move":
+            self.offset_x.set(max(0, int(ox + dx / scale)))
+            self.offset_y.set(max(0, int(oy + dy / scale)))
+        if mode == "offset_x":
+            self.offset_x.set(max(0, int(ox + dx / scale)))
+        if mode == "offset_y":
+            self.offset_y.set(max(0, int(oy + dy / scale)))
+        if mode == "spacing_x":
+            self.spacing_x.set(max(0, int(sx + dx / scale)))
+        if mode == "spacing_y":
+            self.spacing_y.set(max(0, int(sy + dy / scale)))
+
+    def _on_canvas_release(self, event):
+        if self._canvas_drag_mode == "move" and not self._canvas_drag_moved:
+            if self._canvas_pending_select is not None:
+                self._set_preview_frame(self._canvas_pending_select + 1)
+                self._update_canvas()
+
+        self._canvas_drag_mode = None
+        self._canvas_drag_start = None
+        self._canvas_drag_base = None
+        self._canvas_drag_moved = False
+        self._canvas_pending_select = None
+        self.canvas.config(cursor="")
+
+    def _on_canvas_motion(self, event):
+        if not self.pil_image:
+            return
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        mode, _ = self._canvas_hit_test(x, y)
+        cursors = {
+            "frame_w": "sb_h_double_arrow",
+            "frame_h": "sb_v_double_arrow",
+            "corner": "sizing",
+            "offset_x": "sb_h_double_arrow",
+            "offset_y": "sb_v_double_arrow",
+            "spacing_x": "sb_h_double_arrow",
+            "spacing_y": "sb_v_double_arrow",
+            "move": "fleur",
+        }
+        self.canvas.config(cursor=cursors.get(mode, ""))
 
     # ─────────────────────────────────────────────────────────────
     # MAIN
